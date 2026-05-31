@@ -103,13 +103,24 @@ Preferences prefs;
 WebServer configServer(80);
 
 bool configPortalActive = false;
+bool configPortalRecoveryMode = false;
 bool tcpServerStarted = false;
 bool rebootScheduled = false;
 uint32_t rebootAtMs = 0;
+uint32_t configPortalStartedAtMs = 0;
 
 bool portalStartScheduled = false;
 uint32_t portalStartAtMs = 0;
 constexpr uint32_t PORTAL_START_DELAY_MS = 700;
+
+bool hasStoredWiFiConfig = false;
+bool wifiWasConnected = false;
+uint32_t wifiLostAtMs = 0;
+uint32_t lastWifiReconnectAttemptMs = 0;
+constexpr uint32_t WIFI_LOST_GRACE_MS = 30000;
+constexpr uint32_t WIFI_RECONNECT_BEFORE_PORTAL_MS = 120000;
+constexpr uint32_t WIFI_RECONNECT_INTERVAL_MS = 10000;
+constexpr uint32_t PORTAL_IDLE_REBOOT_MS = 5UL * 60UL * 1000UL;
 
 // mDNS Announcement-Intervall
 constexpr uint32_t MDNS_ANNOUNCE_NO_CLIENT_MS = 60UL * 1000UL;
@@ -128,6 +139,8 @@ size_t serialInputLen = 0;
 
 // Forward Declaration aus sequences.ino
 void executeInitSequence();
+void getGatewayMacHex(char* out, size_t outLen);
+void getGatewayMacColon(char* out, size_t outLen);
 
 // ============================================================
 // Hilfsfunktionen: Logging / Client
@@ -482,7 +495,7 @@ void handleTuneCommand(char* args) {
     bool profileChanged = (currentTxProfile != newProfile);
 
     if (!txChanged && !rxChanged && !profileChanged) {
-      Serial.printf("[RADIO] Unverändert: TX=%u RX=%u PROFILE=%s\n", currentTxChannel, currentRxChannel, txProfileToString(currentTxProfile));
+      Serial.printf("[RADIO] Unchanged: TX=%u RX=%u PROFILE=%s\n", currentTxChannel, currentRxChannel, txProfileToString(currentTxProfile));
     } else {
       // 1. Immer erst Standby für Settings
       cmtGoStandby();
@@ -500,7 +513,7 @@ void handleTuneCommand(char* args) {
       // 4. Zurück auf RX-Kanal (die V2-Logik dafür)
       restoreRxAfterTx(); // Deine V2-Funktion, die enterRxListenModeOnCurrentChannel ersetzt
 
-      Serial.printf("[RADIO] Konfig aktualisiert: TX=%u RX=%u PROFILE=%s\n", currentTxChannel, currentRxChannel, txProfileToString(currentTxProfile));
+      Serial.printf("[RADIO] Config updated: TX=%u RX=%u PROFILE=%s\n", currentTxChannel, currentRxChannel, txProfileToString(currentTxProfile));
     }
 
     sendLineToClient("ACK:TUNED");
@@ -540,7 +553,7 @@ void handleTxCommand(const char* hexPayload) {
 
   const bool success = sendPacket(txBuffer, static_cast<uint8_t>(packetLen));
   sendLineToClient(success ? "ACK:TX_OK" : "ERR:TX_FAIL");
-  Serial.println(success ? "TX erfolgreich" : "TX fehlgeschlagen");
+  Serial.println(success ? "TX successful" : "TX failed");
 }
 
 bool loadStoredWiFi(char* ssidOut, size_t ssidOutLen, char* passOut, size_t passOutLen) {
@@ -552,11 +565,13 @@ bool loadStoredWiFi(char* ssidOut, size_t ssidOutLen, char* passOut, size_t pass
   prefs.end();
 
   if (ssid.isEmpty()) {
+    hasStoredWiFiConfig = false;
     ssidOut[0] = '\0';
     passOut[0] = '\0';
     return false;
   }
 
+  hasStoredWiFiConfig = true;
   ssid.toCharArray(ssidOut, ssidOutLen);
   pass.toCharArray(passOut, passOutLen);
   return true;
@@ -568,7 +583,7 @@ void saveStoredWiFi(const char* ssid, const char* pass) {
   prefs.putString(PREF_KEY_PASS, pass);
   prefs.end();
 
-  Serial.printf("[WIFI] WLAN-Daten gespeichert. SSID='%s'\n", ssid);
+  Serial.printf("[WIFI] Wi-Fi credentials saved. SSID='%s'\n", ssid);
 }
 
 void clearStoredWiFi() {
@@ -576,13 +591,14 @@ void clearStoredWiFi() {
   prefs.remove(PREF_KEY_SSID);
   prefs.remove(PREF_KEY_PASS);
   prefs.end();
+  hasStoredWiFiConfig = false;
 }
 
 void ensureTcpServerStarted() {
   if (!tcpServerStarted) {
     server.begin();
     tcpServerStarted = true;
-    Serial.printf("TCP Server gestartet auf Port %u\n", TCP_PORT);
+    Serial.printf("TCP server started on port %u\n", TCP_PORT);
   }
 }
 
@@ -592,8 +608,10 @@ void stopConfigPortal() {
   configServer.stop();
   WiFi.softAPdisconnect(true);
   configPortalActive = false;
+  configPortalRecoveryMode = false;
+  configPortalStartedAtMs = 0;
 
-  Serial.println("Config-Portal gestoppt.");
+  Serial.println("Config portal stopped.");
 }
 
 String makeSetupApSsid() {
@@ -603,13 +621,17 @@ String makeSetupApSsid() {
   return String(buf);
 }
 
-void startConfigPortal() {
+void startConfigPortal(bool recoveryMode = false) {
   tcpLedOverride = false;
   currentSystemState = STATE_UNCONFIGURED;
   if (configPortalActive) return;
 
-  WiFi.disconnect(false, false);
-  WiFi.mode(WIFI_AP);
+  if (recoveryMode) {
+    WiFi.mode(WIFI_AP_STA);
+  } else {
+    WiFi.disconnect(false, false);
+    WiFi.mode(WIFI_AP);
+  }
 
   const String apSsid = makeSetupApSsid();
   WiFi.softAP(apSsid.c_str());
@@ -649,7 +671,7 @@ void startConfigPortal() {
 
   configServer.on("/save", HTTP_POST, []() {
     if (!configServer.hasArg("ssid")) {
-      Serial.println("[PORTAL] Speichern fehlgeschlagen: SSID fehlt.");
+      Serial.println("[PORTAL] Save failed: SSID missing.");
       configServer.send(400, "text/plain", "SSID fehlt");
       return;
     }
@@ -657,7 +679,7 @@ void startConfigPortal() {
     const String ssid = configServer.arg("ssid");
     const String pass = configServer.arg("pass");
 
-    Serial.printf("[PORTAL] Neue WLAN-Daten erhalten. SSID='%s'\n", ssid.c_str());
+    Serial.printf("[PORTAL] New Wi-Fi credentials received. SSID='%s'\n", ssid.c_str());
 
     saveStoredWiFi(ssid.c_str(), pass.c_str());
 
@@ -667,7 +689,7 @@ void startConfigPortal() {
       "<html><body><h3>Gespeichert.</h3><p>Der ESP startet jetzt neu.</p></body></html>"
     );
 
-    Serial.println("[PORTAL] WLAN-Daten gespeichert. Neustart geplant.");
+    Serial.println("[PORTAL] Wi-Fi credentials saved. Reboot scheduled.");
 
     rebootScheduled = true;
     rebootAtMs = millis() + 1500;
@@ -692,11 +714,47 @@ void startConfigPortal() {
 
   configServer.begin();
   configPortalActive = true;
+  configPortalRecoveryMode = recoveryMode;
+  configPortalStartedAtMs = millis();
 
-  Serial.println("[PORTAL] WLAN-Konfigurationsportal aktiv.");
+  Serial.println(recoveryMode
+    ? "[PORTAL] Wi-Fi recovery portal active. STA reconnect keeps running."
+    : "[PORTAL] Wi-Fi configuration portal active.");
   Serial.printf("[PORTAL] AP-SSID: %s\n", apSsid.c_str());
-  Serial.printf("[PORTAL] Portal erreichbar unter: http://%s/\n", ip.toString().c_str());
-  Serial.println("[PORTAL] Benutzer kann jetzt SSID und Passwort eingeben.");
+  Serial.printf("[PORTAL] Portal available at: http://%s/\n", ip.toString().c_str());
+  Serial.println("[PORTAL] User can now enter SSID and password.");
+}
+
+void startMdnsResponder() {
+  if (mdnsResponderStarted) return;
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  uint8_t mac[6];
+  WiFi.macAddress(mac);
+  char mdnsName[32];
+  snprintf(mdnsName, sizeof(mdnsName), "diivoo-gw-%02x%02x%02x%02x%02x%02x", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
+  if (MDNS.begin(mdnsName)) {
+    mdnsResponderStarted = true;
+    lastMdnsAnnounceMs = millis();
+    lastMdnsHadClient = hasActiveClient();
+
+    Serial.printf("[mDNS] Responder started: %s.local\n", mdnsName);
+    MDNS.addService("diivoo", "tcp", TCP_PORT);
+
+    char macHex[13];
+    char macColon[18];
+    getGatewayMacHex(macHex, sizeof(macHex));
+    getGatewayMacColon(macColon, sizeof(macColon));
+
+    MDNS.addServiceTxt("diivoo", "tcp", "model", FW_MODEL);
+    MDNS.addServiceTxt("diivoo", "tcp", "version", FW_VERSION);
+    MDNS.addServiceTxt("diivoo", "tcp", "mac", macHex);
+    MDNS.addServiceTxt("diivoo", "tcp", "mac_colon", macColon);
+  } else {
+    mdnsResponderStarted = false;
+    Serial.println("[mDNS] Failed to start mDNS responder!");
+  }
 }
 
 bool connectToStoredWiFi(uint32_t timeoutMs = WIFI_CONNECT_TIMEOUT_MS) {
@@ -705,22 +763,22 @@ bool connectToStoredWiFi(uint32_t timeoutMs = WIFI_CONNECT_TIMEOUT_MS) {
   char ssid[33] = {0};
   char pass[65] = {0};
 
-  Serial.println("[WIFI] Prüfe gespeicherte WLAN-Konfiguration ...");
+  Serial.println("[WIFI] Checking stored Wi-Fi configuration ...");
 
   if (!loadStoredWiFi(ssid, sizeof(ssid), pass, sizeof(pass))) {
-    Serial.println("[WIFI] Keine gespeicherten WLAN-Daten gefunden.");
-    Serial.println("[WIFI] Starte Konfigurations-Hotspot.");
+    Serial.println("[WIFI] No stored Wi-Fi credentials found.");
+    Serial.println("[WIFI] Starting configuration hotspot.");
     return false;
   }
 
-  Serial.printf("[WIFI] Gespeicherte SSID gefunden: '%s'\n", ssid);
+  Serial.printf("[WIFI] Stored SSID found: '%s'\n", ssid);
 
   stopConfigPortal();
 
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, pass);
 
-  Serial.printf("[WIFI] Verbinde mit WLAN '%s' ...\n", ssid);
+  Serial.printf("[WIFI] Connecting to Wi-Fi '%s' ...\n", ssid);
 
   const uint32_t start = millis();
   while (WiFi.status() != WL_CONNECTED && (millis() - start) < timeoutMs) {
@@ -731,63 +789,40 @@ bool connectToStoredWiFi(uint32_t timeoutMs = WIFI_CONNECT_TIMEOUT_MS) {
   Serial.println();
 
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("[WIFI] Verbunden. IP: %s\n", WiFi.localIP().toString().c_str());
-    
-    // mDNS Hostname generieren (diivoo-gw-<MAC>)
-    uint8_t mac[6];
-    WiFi.macAddress(mac);
-    char mdnsName[32];
-    snprintf(mdnsName, sizeof(mdnsName), "diivoo-gw-%02x%02x%02x%02x%02x%02x", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-    
-    if (MDNS.begin(mdnsName)) {
-      mdnsResponderStarted = true;
-      lastMdnsAnnounceMs = millis();
-      lastMdnsHadClient = hasActiveClient();
+    Serial.printf("[WIFI] Connected. IP: %s\n", WiFi.localIP().toString().c_str());
+    wifiWasConnected = true;
+    wifiLostAtMs = 0;
+    lastWifiReconnectAttemptMs = 0;
 
-      Serial.printf("[mDNS] Responder gestartet: %s.local\n", mdnsName);
-      MDNS.addService("diivoo", "tcp", TCP_PORT);
-
-      char macHex[13];
-      char macColon[18];
-      getGatewayMacHex(macHex, sizeof(macHex));
-      getGatewayMacColon(macColon, sizeof(macColon));
-
-      MDNS.addServiceTxt("diivoo", "tcp", "model", FW_MODEL);
-      MDNS.addServiceTxt("diivoo", "tcp", "version", FW_VERSION);
-      MDNS.addServiceTxt("diivoo", "tcp", "mac", macHex);
-      MDNS.addServiceTxt("diivoo", "tcp", "mac_colon", macColon);
-    } else {
-      mdnsResponderStarted = false;
-      Serial.println("[mDNS] Fehler beim Starten des mDNS Responders!");
-    }
+    startMdnsResponder();
 
     currentSystemState = STATE_CONNECTED;
     ensureTcpServerStarted();
     return true;
   }
 
-  Serial.printf("[WIFI] Verbindung zu '%s' fehlgeschlagen.\n", ssid);
-  Serial.println("[WIFI] Starte Konfigurations-Hotspot.");
+  Serial.printf("[WIFI] Connection to '%s' failed.\n", ssid);
+  Serial.println("[WIFI] Starting configuration hotspot.");
   return false;
 }
 
 bool performOtaUpdate(const char* url) {
   if (url == nullptr || *url == '\0') {
-    Serial.println("[OTA] Fehler: leere URL.");
+    Serial.println("[OTA] Error: empty URL.");
     sendLineToClientAndSerial("ERR:OTA_EMPTY_URL");
     return false;
   }
 
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("[OTA] Fehler: kein WLAN verbunden.");
+    Serial.println("[OTA] Error: Wi-Fi not connected.");
     sendLineToClientAndSerial("ERR:OTA_NO_WIFI");
     return false;
   }
 
-  Serial.printf("[OTA] Starte OTA-Update von: %s\n", url);
+  Serial.printf("[OTA] Starting OTA update from: %s\n", url);
   sendLineToClientAndSerial("ACK:OTA_START");
 
-  Serial.println("[OTA] Setze RF-Chip in Standby.");
+  Serial.println("[OTA] Setting RF chip to standby.");
   cmtGoStandby();
 
   // Wichtig: automatischen Reboot deaktivieren,
@@ -801,20 +836,20 @@ bool performOtaUpdate(const char* url) {
     case HTTP_UPDATE_FAILED: {
       int err = httpUpdate.getLastError();
       String reason = httpUpdate.getLastErrorString();
-      Serial.printf("[OTA] Fehlgeschlagen. Code=%d, Grund=%s\n", err, reason.c_str());
+      Serial.printf("[OTA] Failed. Code=%d, reason=%s\n", err, reason.c_str());
       sendLineToClientAndSerial("ERR:OTA_FAILED");
       restoreRxAfterTx();
       return false;
     }
 
     case HTTP_UPDATE_NO_UPDATES:
-      Serial.println("[OTA] Keine neuere Firmware verfügbar.");
+      Serial.println("[OTA] No newer firmware available.");
       sendLineToClientAndSerial("ACK:OTA_NO_UPDATES");
       restoreRxAfterTx();
       return false;
 
     case HTTP_UPDATE_OK:
-      Serial.println("[OTA] Update erfolgreich geschrieben. Sende ACK und starte neu.");
+      Serial.println("[OTA] Update written successfully. Sending ACK and rebooting.");
       sendLineToClientAndSerial("ACK:OTA_OK");
       Serial.flush();
       delay(1000);
@@ -822,7 +857,7 @@ bool performOtaUpdate(const char* url) {
       return true;
   }
 
-  Serial.println("[OTA] Unerwarteter Zustand.");
+  Serial.println("[OTA] Unexpected state.");
   sendLineToClientAndSerial("ERR:OTA_UNKNOWN_STATE");
   restoreRxAfterTx();
   return false;
@@ -831,10 +866,22 @@ bool performOtaUpdate(const char* url) {
 void serviceConfigPortal() {
   if (configPortalActive) {
     configServer.handleClient();
+
+    if (configPortalRecoveryMode && !rebootScheduled) {
+      const uint32_t now = millis();
+      const bool portalIdleExpired = (now - configPortalStartedAtMs) >= PORTAL_IDLE_REBOOT_MS;
+      const bool hasSetupClient = WiFi.softAPgetStationNum() > 0;
+
+      if (portalIdleExpired && !hasSetupClient) {
+        Serial.println("[PORTAL] Recovery portal was open for 5 minutes without a client. Reboot scheduled.");
+        rebootScheduled = true;
+        rebootAtMs = now + 1000;
+      }
+    }
   }
 
   if (rebootScheduled && millis() >= rebootAtMs) {
-    Serial.println("Neustart...");
+    Serial.println("Rebooting...");
     delay(100);
     ESP.restart();
   }
@@ -844,10 +891,73 @@ void serviceDeferredActions() {
   if (portalStartScheduled && millis() >= portalStartAtMs) {
     portalStartScheduled = false;
 
-    Serial.println("[PORTAL] Wechsle jetzt in den Konfigurations-Hotspot.");
-    Serial.println("[PORTAL] Aktuelle WLAN-Verbindung wird getrennt.");
+    Serial.println("[PORTAL] Switching to configuration hotspot now.");
+    Serial.println("[PORTAL] Current Wi-Fi connection will be disconnected.");
 
     startConfigPortal();
+  }
+}
+
+void serviceWiFiRecovery() {
+  if (!hasStoredWiFiConfig) return;
+
+  const uint32_t now = millis();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!wifiWasConnected) {
+      Serial.printf("[WIFI] Connection restored. IP: %s\n", WiFi.localIP().toString().c_str());
+    }
+
+    wifiWasConnected = true;
+    wifiLostAtMs = 0;
+    lastWifiReconnectAttemptMs = 0;
+    currentSystemState = STATE_CONNECTED;
+
+    if (configPortalRecoveryMode) {
+      stopConfigPortal();
+    }
+
+    startMdnsResponder();
+    ensureTcpServerStarted();
+    return;
+  }
+
+  if (configPortalActive && !configPortalRecoveryMode) {
+    return;
+  }
+
+  if (wifiLostAtMs == 0) {
+    wifiWasConnected = false;
+    wifiLostAtMs = now;
+    lastWifiReconnectAttemptMs = 0;
+    currentSystemState = STATE_CONNECTING;
+
+    if (mdnsResponderStarted) {
+      MDNS.end();
+      mdnsResponderStarted = false;
+    }
+
+    if (hasActiveClient()) {
+      activeClient.stop();
+      activeClient = WiFiClient();
+      inputBufferLen = 0;
+      inputBuffer[0] = '\0';
+    }
+
+    Serial.println("[WIFI] Connection lost. Starting reconnect attempts before opening the setup AP.");
+  }
+
+  if ((now - wifiLostAtMs) >= WIFI_LOST_GRACE_MS &&
+      (lastWifiReconnectAttemptMs == 0 || (now - lastWifiReconnectAttemptMs) >= WIFI_RECONNECT_INTERVAL_MS)) {
+    lastWifiReconnectAttemptMs = now;
+    Serial.println("[WIFI] Reconnect attempt ...");
+    WiFi.mode(configPortalRecoveryMode ? WIFI_AP_STA : WIFI_STA);
+    WiFi.reconnect();
+  }
+
+  if (!configPortalActive && (now - wifiLostAtMs) >= WIFI_RECONNECT_BEFORE_PORTAL_MS) {
+    Serial.println("[WIFI] Reconnect still unsuccessful. Starting recovery setup AP for 5 minutes.");
+    startConfigPortal(true);
   }
 }
 
@@ -961,7 +1071,7 @@ void processCommand(char* cmd) {
   }
 
   if (strcmp(cmd, "PORTAL") == 0) {
-    Serial.println("[PORTAL] Portal-Start angefordert.");
+    Serial.println("[PORTAL] Portal start requested.");
     sendLineToClientAndSerial("ACK:PORTAL_STARTING");
 
     portalStartScheduled = true;
@@ -977,10 +1087,10 @@ void processCommand(char* cmd) {
 
   if (strcmp(cmd, "WIFI") == 0) {
     if (WiFi.status() == WL_CONNECTED) {
-      Serial.printf("WLAN verbunden. IP: %s\n", WiFi.localIP().toString().c_str());
+      Serial.printf("Wi-Fi connected. IP: %s\n", WiFi.localIP().toString().c_str());
       sendLineToClient("ACK:WIFI_OK");
     } else {
-      Serial.println("WLAN nicht verbunden.");
+      Serial.println("Wi-Fi not connected.");
       sendLineToClient("ERR:WIFI_DOWN");
     }
     return;
@@ -1060,7 +1170,7 @@ void handleReceivedPacket() {
 // ============================================================
 void serviceClientLifecycle() {
   if (activeClient && !activeClient.connected()) {
-    Serial.println("NodeJS getrennt.");
+    Serial.println("NodeJS disconnected.");
     activeClient.stop();
     activeClient = WiFiClient();
     inputBufferLen = 0;
@@ -1071,7 +1181,7 @@ void serviceClientLifecycle() {
     WiFiClient newClient = server.available();
     if (newClient) {
       activeClient = newClient;
-      Serial.println("NodeJS verbunden!");
+      Serial.println("NodeJS connected!");
     }
   }
 }
@@ -1159,7 +1269,7 @@ void applyShortPreambleRegisters() {
   writeRegister(0x39, 0x28); // CUS_PKT2: TX_PREAM_SIZE[7:0]
   writeRegister(0x3A, 0x00); // CUS_PKT3: TX_PREAM_SIZE[15:8]
   writeRegister(0x3B, 0xAA); // CUS_PKT4: PREAM_VALUE
-  Serial.println("[RADIO] Short-Preamble Register gesetzt (40 units)");
+  Serial.println("[RADIO] Short preamble registers set (40 units)");
 }
 
 void applyLongPreambleRegisters() {
@@ -1167,7 +1277,7 @@ void applyLongPreambleRegisters() {
   writeRegister(0x39, 0x2C); // CUS_PKT2: TX_PREAM_SIZE[7:0]
   writeRegister(0x3A, 0x01); // CUS_PKT3: TX_PREAM_SIZE[15:8]
   writeRegister(0x3B, 0xAA); // CUS_PKT4: PREAM_VALUE
-  Serial.println("[RADIO] Long-Preamble Register gesetzt (300 units)");
+  Serial.println("[RADIO] Long preamble registers set (300 units)");
 }
 
 bool applyPreambleProfileIfNeeded(uint8_t newProfile) {
@@ -1183,7 +1293,7 @@ bool applyPreambleProfileIfNeeded(uint8_t newProfile) {
   }
 
   currentTxProfile = newProfile;
-  Serial.printf("[RADIO] TX-Profil gewechselt auf: %s\n", txProfileToString(currentTxProfile));
+  Serial.printf("[RADIO] TX profile changed to: %s\n", txProfileToString(currentTxProfile));
   return true;
 }
 
@@ -1263,9 +1373,9 @@ void setup() {
 
   Serial.println();
   Serial.println("========================================");
-  Serial.println("Diivoo TCP Gateway startet");
+  Serial.println("Diivoo TCP Gateway starting");
   Serial.println("========================================");
-  Serial.println("[BOOT] Initialisiere Hardware ...");
+  Serial.println("[BOOT] Initializing hardware ...");
 
   // Hardware UI initialisieren
   pinMode(PIN_LED, OUTPUT);
@@ -1280,10 +1390,10 @@ void setup() {
   WiFi.persistent(false);
 
   if (!connectToStoredWiFi()) {
-    startConfigPortal();
+    startConfigPortal(hasStoredWiFiConfig);
   }
 
-  server.begin();
+  ensureTcpServerStarted();
 
   pinMode(PIN_VCC_EN, OUTPUT);
   pinMode(PIN_SCLK, OUTPUT);
@@ -1304,35 +1414,36 @@ void setup() {
   // Wie bisher: nach Init nochmal explizit auf aktuellen RX-Kanal gehen
   cmtGoStandby();
   cmtSelectChannel(currentRxChannel);
-  Serial.println("[BOOT] RF-Initialisierung abgeschlossen.");
-  Serial.printf("[BOOT] Standard RX-Kanal: %u\n", currentRxChannel);
+  Serial.println("[BOOT] RF initialization complete.");
+  Serial.printf("[BOOT] Default RX channel: %u\n", currentRxChannel);
   cmtGoRx();
 
   attachInterrupt(digitalPinToInterrupt(PIN_INTERRUPT), onPacketReceived, RISING);
   
-  Serial.println("Eingehende Befehle über Serial/TCP:");
+  Serial.println("Incoming commands via Serial/TCP:");
   Serial.println("  TUNE:<tx>:<rx>[:<profile>]  (profile: short/long, optional)");
   Serial.println("  TX:<hex>");
   Serial.println("  LED:ON / LED:OFF");
   Serial.println("  OTA:<url>");
-  Serial.println("  PING_URL:<url>  (prueft ob URL erreichbar ist -> ACK:PING_OK / ERR:PING_UNREACHABLE)");
+  Serial.println("  PING_URL:<url>  (checks whether URL is reachable -> ACK:PING_OK / ERR:PING_UNREACHABLE)");
   Serial.println("  VERSION");
   Serial.println("  PORTAL");
   Serial.println("  CLEARWIFI");
   Serial.println("  WIFI");
   Serial.println("----------------------------------------");
-  Serial.println("Ausgehende Events (via TCP):");
+  Serial.println("Outgoing events (via TCP):");
   Serial.println("  BTN:PRESSED");
   Serial.println("  BTN:RELEASED");
   Serial.println("========================================");
 
-  Serial.println("Warte auf Pakete...");
+  Serial.println("Waiting for packets...");
 }
 
 void loop() {
   serviceSerialInput();
   serviceConfigPortal();
   serviceDeferredActions();
+  serviceWiFiRecovery();
   serviceMdnsAnnounce();
   handleHardwareUI();
 
