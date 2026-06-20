@@ -613,6 +613,7 @@ class WebServer {
         const durationSeconds = Math.max(1, Number(channel.settings.durationSeconds) || 600);
 
         return {
+            alias: channel.settings.alias ?? null,
             defaultOpenSeconds: durationSeconds,
             defaultOpenMinutes: Math.max(1, Math.round(durationSeconds / 60)),
             intervalOnSeconds: Math.max(1, Number(channel.settings.intervalOnSeconds) || 10),
@@ -665,6 +666,10 @@ class WebServer {
                 }
                 channel.settings.rainDelayDate = date;
             }
+        }
+
+        if (config.alias != null) {
+            channel.settings.alias = config.alias && config.alias.trim() ? config.alias.trim() : null;
         }
     }
 

@@ -253,7 +253,7 @@
             >
               <div class="flex items-start justify-between gap-3 max-md:flex-col max-md:items-stretch">
                 <div class="min-w-0">
-                  <strong class="block text-lg leading-[1.1] tracking-[-0.02em]">Valve {{ channelId }}</strong>
+                  <strong class="block text-lg leading-[1.1] tracking-[-0.02em]">{{ getDefaultChannelConfig(device.valveId, channelId).alias || `Valve ${channelId}` }}</strong>
                   <span class="theme-text-muted mt-1 block text-[13px] leading-[1.4]">
                     {{ channel.source || 'Manual' }}
                   </span>
@@ -589,6 +589,30 @@
         <template v-else-if="activeSheet === 'config'">
           <div class="grid gap-4">
             <div class="grid gap-3">
+              <div class="text-[15px] font-extrabold tracking-[-0.02em]">Valve name</div>
+              <div class="grid gap-2.5 md:grid-cols-2">
+                <div class="theme-soft grid min-w-0 gap-1.5 rounded-[18px] border px-3.5 py-3">
+                  <label for="valveAlias" class="theme-text-muted text-xs font-bold">Custom name</label>
+                  <input
+                    id="valveAlias"
+                    v-model="configDraft.alias"
+                    class="theme-input min-h-11 w-full rounded-xl border px-3"
+                    type="text"
+                    maxlength="64"
+                    :placeholder="`Valve ${activeChannel?.channelId}`"
+                  />
+                </div>
+
+                <div class="theme-soft grid min-w-0 gap-1.5 rounded-[18px] border px-3.5 py-3">
+                  <label class="theme-text-muted text-xs font-bold">Note</label>
+                  <div class="theme-text-muted text-xs leading-[1.4]">
+                    Give this valve a descriptive name, e.g. "Front garden".
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="grid gap-3">
               <div class="text-[15px] font-extrabold tracking-[-0.02em]">Default runtime</div>
               <div class="grid gap-2.5 md:grid-cols-2">
                 <div class="theme-soft grid min-w-0 gap-1.5 rounded-[18px] border px-3.5 py-3">
@@ -760,6 +784,7 @@ const planForm = reactive({
 })
 
 const configDraft = reactive({
+  alias: '',
   defaultOpenMinutes: 10,
   rainStopUntil: '',
 })
@@ -830,7 +855,8 @@ const activeDevice = computed(() => {
 const sheetTitle = computed(() => {
   if (activeSheet.value === 'rawEdit') return 'Database Editor'
   if (!activeChannel.value) return 'Schedule'
-  const base = `Valve ${activeChannel.value.channelId}`
+  const config = getDefaultChannelConfig(activeChannel.value.deviceId, activeChannel.value.channelId)
+  const base = config.alias || `Valve ${activeChannel.value.channelId}`
   return activeSheet.value === 'plan' ? `${base} · Schedules` : `${base} · Settings`
 })
 
@@ -973,6 +999,7 @@ function getDefaultChannelConfig(deviceId, channelId) {
 
   if (!channelConfigs.value[key]) {
     channelConfigs.value[key] = {
+      alias: null,
       defaultOpenMinutes: 10,
       rainStopUntil: '',
       schedules: [],
@@ -1007,6 +1034,10 @@ function mergeChannelConfigFromDevice(device) {
       config.defaultOpenMinutes = Number(source.defaultOpenMinutes)
     } else if (Number.isFinite(Number(source.defaultOpenSeconds))) {
       config.defaultOpenMinutes = Math.max(1, Math.round(Number(source.defaultOpenSeconds) / 60))
+    }
+
+    if (typeof source.alias === 'string' || source.alias === null) {
+      config.alias = source.alias || null
     }
 
     if (typeof source.rainStopUntil === 'string') {
@@ -1301,6 +1332,7 @@ function openSheet(type, deviceId, channelId) {
     planForm.mistOnSeconds = 10
     planForm.mistOffSeconds = 30
   } else {
+    configDraft.alias = config.alias || ''
     configDraft.defaultOpenMinutes = Math.max(1, Number(config.defaultOpenMinutes || 10))
     configDraft.rainStopUntil = toDateTimeLocalInput(config.rainStopUntil)
   }
@@ -1534,11 +1566,13 @@ function saveChannelConfig() {
 
   config.defaultOpenMinutes = Math.max(1, Math.min(1440, Number(configDraft.defaultOpenMinutes) || 10))
   config.rainStopUntil = configDraft.rainStopUntil || ''
+  config.alias = configDraft.alias.trim() || null
 
   socket.emit('saveChannelConfig', {
     valveId: activeChannel.value.deviceId,
     channelId: activeChannel.value.channelId,
     config: {
+      alias: config.alias,
       defaultOpenMinutes: config.defaultOpenMinutes,
       defaultOpenSeconds: config.defaultOpenMinutes * 60,
       rainStopUntil: config.rainStopUntil,
@@ -1590,6 +1624,10 @@ function handleChannelConfigState({ valveId, channelId, config }) {
 
   const target = getDefaultChannelConfig(valveId, channelId)
 
+  if (typeof config.alias === 'string' || config.alias === null) {
+    target.alias = config.alias || null
+  }
+
   if (Number.isFinite(Number(config.defaultOpenMinutes))) {
     target.defaultOpenMinutes = Number(config.defaultOpenMinutes)
   } else if (Number.isFinite(Number(config.defaultOpenSeconds))) {
@@ -1610,6 +1648,7 @@ function handleChannelConfigState({ valveId, channelId, config }) {
     Number(activeChannel.value.deviceId) === Number(valveId) &&
     Number(activeChannel.value.channelId) === Number(channelId)
   ) {
+    configDraft.alias = target.alias || ''
     configDraft.defaultOpenMinutes = Math.max(1, Number(target.defaultOpenMinutes || 10))
     configDraft.rainStopUntil = toDateTimeLocalInput(target.rainStopUntil)
   }
